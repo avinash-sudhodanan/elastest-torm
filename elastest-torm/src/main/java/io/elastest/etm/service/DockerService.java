@@ -1,12 +1,20 @@
 package io.elastest.etm.service;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
 import org.apache.maven.plugins.surefire.report.ReportTestSuite;
 import org.apache.maven.plugins.surefire.report.SurefireReportParser;
 import org.apache.maven.reporting.MavenReportException;
@@ -16,6 +24,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Bind;
 import com.github.dockerjava.api.model.LogConfig;
 import com.github.dockerjava.api.model.LogConfig.LoggingType;
@@ -40,7 +49,7 @@ public class DockerService {
 
 	// On Linux: "/test-results". On Windows: "c:/Users/docker/test-results"
 	@Value("${elastest.test-results.directory}")
-	private String volumeDirectoryToWriteTestResutls;
+	private String volumeDirectoryToWriteTestResults;
 
 	// On Windows: "c:/Users/docker/test-results"
 	@Value("${elastest.test-results.directory.windows}")
@@ -48,7 +57,7 @@ public class DockerService {
 
 	@Value("${docker.host.port}")
 	private String dockerHostPort;
-	
+
 	@Value("${logstash.host:#{null}}")
 	private String logstashHost;
 
@@ -88,9 +97,9 @@ public class DockerService {
 		} else {
 			logger.info("Execute on Linux.");
 			DockerClientConfig config = DefaultDockerClientConfig.createDefaultConfigBuilder()
-					//.withDockerHost(DOKCER_LISTENING_ON_TCP_PORT_PREFIX + utilTools.getHostIp() + ":" + dockerHostPort)
-					.withDockerHost("unix:///var/run/docker.sock")
-					.build();
+					// .withDockerHost(DOKCER_LISTENING_ON_TCP_PORT_PREFIX +
+					// utilTools.getHostIp() + ":" + dockerHostPort)
+					.withDockerHost("unix:///var/run/docker.sock").build();
 			dockerExec.setDockerClient(DockerClientBuilder.getInstance(config).build());
 		}
 	}
@@ -194,13 +203,15 @@ public class DockerService {
 				cmdList.add("sh");
 				cmdList.add("-c");
 
-				commands += "cp -a " + dockerExec.gettJobexec().getTjob().getResultsPath() + "/. /results";
+				// commands += "cp -a " +
+				// dockerExec.gettJobexec().getTjob().getResultsPath() + "/.
+				// /results";
 				cmdList.add(commands);
 
 			}
 			// Volumes
 			Volume volume = new Volume("/results");
-			String localDirToWriteTestResults = volumeDirectoryToWriteTestResutls + "/" + dockerExec.getExecutionId();
+			String localDirToWriteTestResults = volumeDirectoryToWriteTestResults + "/" + dockerExec.getExecutionId();
 			String localDirToTeadTestResults = volumeDirectoryToReadTestResults + "/" + dockerExec.getExecutionId();
 
 			LogConfig logConfig = getLogConfig(5000, "test_", dockerExec);
@@ -208,8 +219,10 @@ public class DockerService {
 			dockerExec.getDockerClient().pullImageCmd(testImage).exec(new PullImageResultCallback()).awaitSuccess();
 
 			dockerExec.setTestcontainer(dockerExec.getDockerClient().createContainerCmd(testImage).withEnv(envList)
-					.withLogConfig(logConfig).withName("test_" + dockerExec.getExecutionId()).withVolumes(volume)
-					.withBinds(new Bind(localDirToWriteTestResults, volume)).withCmd(cmdList).exec());
+					.withLogConfig(logConfig).withName("test_" + dockerExec.getExecutionId())
+					// .withVolumes(volume).withBinds(new
+					// Bind(localDirToWriteTestResults, volume))
+					.withCmd(cmdList).exec());
 
 			String testContainerId = dockerExec.getTestcontainer().getId();
 			dockerExec.setTestContainerId(testContainerId);
@@ -218,7 +231,17 @@ public class DockerService {
 			int code = dockerExec.getDockerClient().waitContainerCmd(testContainerId)
 					.exec(new WaitContainerResultCallback()).awaitStatusCode();
 			logger.info("Test container ends with code " + code);
-			return this.getTestResults(localDirToTeadTestResults, dockerExec);
+
+			// File dir = new File(localDirToWriteTestResults);
+			// dir.mkdir();
+
+			// dockerExec.getDockerClient()
+			// .copyArchiveFromContainerCmd(testContainerId,
+			// dockerExec.gettJobexec().getTjob().getResultsPath())
+			// .withHostPath(localDirToWriteTestResults).exec();
+
+			copyTestResults(dockerExec);
+			return this.getTestResults(localDirToWriteTestResults, dockerExec);
 
 		} catch (Exception e) {
 			e.printStackTrace();
@@ -234,12 +257,11 @@ public class DockerService {
 		LogConfig logConfig = new LogConfig();
 		logConfig.setType(LoggingType.SYSLOG);
 		Map<String, String> configMap = new HashMap<String, String>();
-		if(logstashHost == null){
+		if (logstashHost == null) {
 			logstashHost = getHostIpByNetwork(dockerExec, dockerExec.getNetwork());
 		}
-		logger.info("Logstash IP to send logs from containers: {}",logstashHost);
-		configMap.put("syslog-address",
-				"tcp://" + logstashHost + ":" + port);
+		logger.info("Logstash IP to send logs from containers: {}", logstashHost);
+		configMap.put("syslog-address", "tcp://" + logstashHost + ":" + port);
 		configMap.put("tag", tagPrefix + dockerExec.getExecutionId() + "_tjobexec");
 		logConfig.setConfig(configMap);
 
@@ -333,4 +355,42 @@ public class DockerService {
 		}
 		return testSuites;
 	}
+
+	public InputStream getFileFromContainer(String containerName, String fileName, DockerExecution dockerExec) {
+		InputStream inputStream = null;
+		if (existsContainer("test_" + dockerExec.getExecutionId(), dockerExec)) {
+			inputStream = dockerExec.getDockerClient().copyArchiveFromContainerCmd(containerName, fileName).exec();
+		}
+		return inputStream;
+	}
+
+	public boolean existsContainer(String containerName, DockerExecution dockerExec) {
+		boolean exists = true;
+		try {
+			dockerExec.getDockerClient().inspectContainerCmd(containerName).exec();
+
+		} catch (NotFoundException e) {
+			exists = false;
+		}
+		return exists;
+	}
+
+	private void copyTestResults(DockerExecution dockerExec) {
+		try {
+			String target = volumeDirectoryToWriteTestResults + "/" + dockerExec.getExecutionId();
+
+			File dir = new File(target);
+			dir.mkdir();
+
+			InputStream inputStream = getFileFromContainer(dockerExec.getTestContainerId(),
+					dockerExec.gettJobexec().getTjob().getResultsPath(), dockerExec);
+
+			String result = IOUtils.toString(inputStream, StandardCharsets.UTF_8);
+			FileUtils.writeStringToFile(new File(target + "/TEST-es.tfcfrd.app1TestJobsJenkins.AppTest.xml"), result,
+					StandardCharsets.UTF_8);
+			
+		} catch (IOException e) {
+		}
+	}
+
 }
